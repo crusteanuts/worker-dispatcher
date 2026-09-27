@@ -179,26 +179,46 @@ export default {
         // before reaching its next await.
         let nextBatchIndex = 0;
 
-        // Round-robin worker selection.
+        // ------------------------------------------------------------
+        // Random worker selection.
         //
-        // Each batch is assigned to the next worker in sequence.
-        // This avoids the random-selection retry loop and provides
-        // predictable, evenly distributed worker assignment.
-        let currentWorkerIndex = 0;
+        // Preserve the original behavior:
+        //
+        // - Select a random worker.
+        // - Do not select the same worker twice consecutively.
+        // ------------------------------------------------------------
 
-        function getNextWorker() {
-            const worker =
-                workers[currentWorkerIndex];
+        let lastWorkerIndex = -1;
 
-            currentWorkerIndex =
-                (currentWorkerIndex + 1) %
-                workers.length;
+        function getRandomWorker() {
+            if (workers.length === 1) {
+                lastWorkerIndex = 0;
+                return workers[0];
+            }
 
-            return worker;
+            let index;
+
+            do {
+                index =
+                    Math.floor(
+                        Math.random() *
+                        workers.length
+                    );
+            } while (
+                index === lastWorkerIndex
+            );
+
+            lastWorkerIndex = index;
+
+            return workers[index];
         }
 
         // Build this ONCE instead of allocating a new headers object
         // for every proxy request.
+        //
+        // This is the same header behavior as the original dispatcher:
+        // forward the supplied headers and force Content-Type to
+        // application/json for the dispatcher -> proxy request.
         const requestHeaders = {
             ...headers,
 
@@ -229,7 +249,7 @@ export default {
                     );
 
                 const workerUrl =
-                    getNextWorker();
+                    getRandomWorker();
 
                 // ----------------------------------------------------
                 // Build only the URL array needed by the proxy worker.
@@ -254,6 +274,8 @@ export default {
                 try {
                     // ------------------------------------------------
                     // Send the batch to the proxy worker.
+                    //
+                    // Headers are forwarded exactly as before.
                     // ------------------------------------------------
 
                     const response =
@@ -387,7 +409,7 @@ export default {
 
                         const candidate =
                             candidates[
-                            candidateIndex
+                                candidateIndex
                             ];
 
                         const result =
