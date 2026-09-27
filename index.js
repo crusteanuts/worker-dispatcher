@@ -20,10 +20,17 @@ export default {
 
         const workers = body.workers;
         const candidates = body.candidates;
+
         const method =
             String(
                 body.method ?? "GET"
             ).toUpperCase();
+
+        const headers =
+            body.headers &&
+                typeof body.headers === "object"
+                ? body.headers
+                : {};
 
         const concurrency =
             Number(
@@ -162,6 +169,13 @@ export default {
         //
         // Each dispatcher worker dynamically takes the next batch.
         //
+        // Each batch selects a random proxy worker from the entire
+        // supplied worker pool, matching the legacy scanner behavior.
+        //
+        // The received headers are forwarded to the proxy worker.
+        // The proxy worker is responsible for sanitizing those
+        // headers before forwarding the request to SmugMug.
+        //
         // The proxy worker receives:
         //
         // {
@@ -174,7 +188,32 @@ export default {
 
         let nextBatchIndex = 0;
 
-        async function processWorker(workerUrl) {
+        let lastWorkerIndex = -1;
+
+        function getRandomWorker() {
+            if (workers.length === 1) {
+                lastWorkerIndex = 0;
+                return workers[0];
+            }
+
+            let index;
+
+            do {
+                index =
+                    Math.floor(
+                        Math.random() *
+                        workers.length
+                    );
+            } while (
+                index === lastWorkerIndex
+            );
+
+            lastWorkerIndex = index;
+
+            return workers[index];
+        }
+
+        async function processWorker() {
             while (true) {
                 const batchIndex =
                     nextBatchIndex++;
@@ -189,6 +228,9 @@ export default {
                 const batch =
                     batches[batchIndex];
 
+                const workerUrl =
+                    getRandomWorker();
+
                 const urls =
                     batch.map(
                         candidate =>
@@ -199,12 +241,13 @@ export default {
                     // ------------------------------------------------
                     // Send the batch to the proxy worker.
                     //
-                    // The proxy worker's POST batch API expects:
+                    // Forward the headers received from runScanner.
                     //
-                    // {
-                    //     urls: [...],
-                    //     method: "HEAD"
-                    // }
+                    // proxy-fetch will sanitize these headers before
+                    // sending the request to photos.smugmug.com.
+                    //
+                    // Content-Type must remain application/json because
+                    // the proxy worker uses it to detect batch mode.
                     // ------------------------------------------------
 
                     const response =
@@ -212,13 +255,14 @@ export default {
                             workerUrl,
                             {
                                 method: "POST",
-                                headers: {
-                                    "Content-Type":
-                                        "application/json",
 
-                                    "Accept":
+                                headers: {
+                                    ...headers,
+
+                                    "Content-Type":
                                         "application/json"
                                 },
+
                                 body:
                                     JSON.stringify({
                                         urls,
@@ -319,9 +363,6 @@ export default {
 
                     // ------------------------------------------------
                     // Map each worker result back to its candidate.
-                    //
-                    // The proxy worker returns results in the same
-                    // order as the supplied urls.
                     // ------------------------------------------------
 
                     for (
@@ -412,7 +453,6 @@ export default {
         const workerCount =
             Math.min(
                 concurrency,
-                workers.length,
                 batches.length
             );
 
@@ -427,9 +467,7 @@ export default {
                         i += 1
                     ) {
                         tasks.push(
-                            processWorker(
-                                workers[i]
-                            )
+                            processWorker()
                         );
                     }
 
