@@ -41,7 +41,8 @@ export default {
 
         const batchSize =
             Number(
-                body.batch_size ?? 10
+                body.batch_size ??
+                10
             );
 
         // ------------------------------------------------------------
@@ -116,7 +117,7 @@ export default {
 
         if (candidates.length === 0) {
             return new Response(
-                JSON.stringify([]),
+                "[]",
                 {
                     status: 200,
                     headers: {
@@ -128,110 +129,131 @@ export default {
         }
 
         // ------------------------------------------------------------
-        // Split candidates into batches
-        // ------------------------------------------------------------
-
-        const batches = [];
-
-        for (
-            let i = 0;
-            i < candidates.length;
-            i += batchSize
-        ) {
-            batches.push(
-                candidates.slice(
-                    i,
-                    i + batchSize
-                )
-            );
-        }
-
-        // ------------------------------------------------------------
         // Worker pool
         //
-        // Each dispatcher worker dynamically takes the next batch.
+        // Do NOT create a batches array.
         //
-        // Each batch selects a random proxy worker from the entire
-        // supplied worker pool, matching the legacy scanner behavior.
+        // Each dispatcher worker calculates its batch boundaries
+        // directly from the batch index. This avoids creating:
         //
-        // The received headers are forwarded to the proxy worker.
-        // The proxy worker is responsible for sanitizing those
-        // headers before forwarding the request to SmugMug.
+        //     candidates.slice(...)
         //
-        // The proxy worker receives:
+        // arrays for every batch.
         //
-        // {
-        //     urls: [...],
-        //     method: "HEAD"
-        // }
+        // Results are written directly into one preallocated array.
+        // This avoids:
         //
-        // It then performs the requests against SmugMug.
+        //     one results[] per worker
+        //     Promise.all() result arrays
+        //     workerResults.flat()
+        //
+        // The proxy worker behavior remains unchanged.
         // ------------------------------------------------------------
 
-        let nextBatchIndex = 0;
-
-        let lastWorkerIndex = -1;
-
-        function getRandomWorker() {
-            if (workers.length === 1) {
-                lastWorkerIndex = 0;
-                return workers[0];
-            }
-
-            let index;
-
-            do {
-                index =
-                    Math.floor(
-                        Math.random() *
-                        workers.length
-                    );
-            } while (
-                index === lastWorkerIndex
+        const batchCount =
+            Math.ceil(
+                candidates.length /
+                batchSize
             );
 
-            lastWorkerIndex = index;
+        const workerCount =
+            Math.min(
+                concurrency,
+                batchCount
+            );
 
-            return workers[index];
+        // Preallocate the final result array.
+        //
+        // Each candidate gets exactly one result slot.
+        //
+        // This is important because it means we do not have to
+        // accumulate separate arrays and merge them afterward.
+        const results =
+            new Array(
+                candidates.length
+            );
+
+        // Shared batch counter.
+        //
+        // Each concurrent processWorker() claims exactly one batch
+        // before reaching its next await.
+        let nextBatchIndex = 0;
+
+        // Round-robin worker selection.
+        //
+        // Each batch is assigned to the next worker in sequence.
+        // This avoids the random-selection retry loop and provides
+        // predictable, evenly distributed worker assignment.
+        let currentWorkerIndex = 0;
+
+        function getNextWorker() {
+            const worker =
+                workers[currentWorkerIndex];
+
+            currentWorkerIndex =
+                (currentWorkerIndex + 1) %
+                workers.length;
+
+            return worker;
         }
 
-        async function processWorker() {
-            const results = [];
+        // Build this ONCE instead of allocating a new headers object
+        // for every proxy request.
+        const requestHeaders = {
+            ...headers,
 
+            "Content-Type":
+                "application/json"
+        };
+
+        async function processWorker() {
             while (true) {
                 const batchIndex =
                     nextBatchIndex++;
 
                 if (
                     batchIndex >=
-                    batches.length
+                    batchCount
                 ) {
-                    return results;
+                    return;
                 }
 
-                const batch =
-                    batches[batchIndex];
+                const start =
+                    batchIndex *
+                    batchSize;
+
+                const end =
+                    Math.min(
+                        start + batchSize,
+                        candidates.length
+                    );
 
                 const workerUrl =
-                    getRandomWorker();
+                    getNextWorker();
+
+                // ----------------------------------------------------
+                // Build only the URL array needed by the proxy worker.
+                //
+                // This avoids creating a batch array with slice().
+                // ----------------------------------------------------
 
                 const urls =
-                    batch.map(
-                        candidate =>
-                            candidate.url
+                    new Array(
+                        end - start
                     );
+
+                for (
+                    let i = start;
+                    i < end;
+                    i += 1
+                ) {
+                    urls[i - start] =
+                        candidates[i].url;
+                }
 
                 try {
                     // ------------------------------------------------
                     // Send the batch to the proxy worker.
-                    //
-                    // Forward the headers received from runScanner.
-                    //
-                    // proxy-fetch will sanitize these headers before
-                    // sending the request to photos.smugmug.com.
-                    //
-                    // Content-Type must remain application/json because
-                    // the proxy worker uses it to detect batch mode.
                     // ------------------------------------------------
 
                     const response =
@@ -240,12 +262,8 @@ export default {
                             {
                                 method: "POST",
 
-                                headers: {
-                                    ...headers,
-
-                                    "Content-Type":
-                                        "application/json"
-                                },
+                                headers:
+                                    requestHeaders,
 
                                 body:
                                     JSON.stringify({
@@ -259,16 +277,20 @@ export default {
                         const errorText =
                             await response.text();
 
+                        const errorMessage =
+                            `Worker returned HTTP ${response.status}: ${errorText}`;
+
                         for (
-                            const candidate
-                            of batch
+                            let i = start;
+                            i < end;
+                            i += 1
                         ) {
-                            results.push({
+                            results[i] = {
                                 key:
-                                    candidate.key,
+                                    candidates[i].key,
 
                                 url:
-                                    candidate.url,
+                                    candidates[i].url,
 
                                 worker:
                                     workerUrl,
@@ -277,8 +299,8 @@ export default {
                                     null,
 
                                 error:
-                                    `Worker returned HTTP ${response.status}: ${errorText}`
-                            });
+                                    errorMessage
+                            };
                         }
 
                         continue;
@@ -291,15 +313,16 @@ export default {
                             await response.json();
                     } catch {
                         for (
-                            const candidate
-                            of batch
+                            let i = start;
+                            i < end;
+                            i += 1
                         ) {
-                            results.push({
+                            results[i] = {
                                 key:
-                                    candidate.key,
+                                    candidates[i].key,
 
                                 url:
-                                    candidate.url,
+                                    candidates[i].url,
 
                                 worker:
                                     workerUrl,
@@ -309,7 +332,7 @@ export default {
 
                                 error:
                                     "Worker returned invalid JSON"
-                            });
+                            };
                         }
 
                         continue;
@@ -321,15 +344,16 @@ export default {
                         )
                     ) {
                         for (
-                            const candidate
-                            of batch
+                            let i = start;
+                            i < end;
+                            i += 1
                         ) {
-                            results.push({
+                            results[i] = {
                                 key:
-                                    candidate.key,
+                                    candidates[i].key,
 
                                 url:
-                                    candidate.url,
+                                    candidates[i].url,
 
                                 worker:
                                     workerUrl,
@@ -339,29 +363,40 @@ export default {
 
                                 error:
                                     "Worker response missing results array"
-                            });
+                            };
                         }
 
                         continue;
                     }
 
                     // ------------------------------------------------
-                    // Map each worker result back to its candidate.
+                    // Map worker results directly into the final
+                    // preallocated result array.
+                    //
+                    // The result order remains exactly the same as
+                    // the candidate order.
                     // ------------------------------------------------
 
                     for (
-                        let i = 0;
-                        i < batch.length;
-                        i += 1
+                        let offset = 0;
+                        offset < end - start;
+                        offset += 1
                     ) {
+                        const candidateIndex =
+                            start + offset;
+
                         const candidate =
-                            batch[i];
+                            candidates[
+                            candidateIndex
+                            ];
 
                         const result =
-                            data.results[i];
+                            data.results[offset];
 
                         if (!result) {
-                            results.push({
+                            results[
+                                candidateIndex
+                            ] = {
                                 key:
                                     candidate.key,
 
@@ -376,12 +411,14 @@ export default {
 
                                 error:
                                     "Missing result for candidate"
-                            });
+                            };
 
                             continue;
                         }
 
-                        results.push({
+                        results[
+                            candidateIndex
+                        ] = {
                             key:
                                 candidate.key,
 
@@ -396,7 +433,7 @@ export default {
                             error:
                                 result.error ||
                                 ""
-                        });
+                        };
                     }
 
                 } catch (error) {
@@ -406,15 +443,16 @@ export default {
                             : String(error);
 
                     for (
-                        const candidate
-                        of batch
+                        let i = start;
+                        i < end;
+                        i += 1
                     ) {
-                        results.push({
+                        results[i] = {
                             key:
-                                candidate.key,
+                                candidates[i].key,
 
                             url:
-                                candidate.url,
+                                candidates[i].url,
 
                             worker:
                                 workerUrl,
@@ -424,7 +462,7 @@ export default {
 
                             error:
                                 message
-                        });
+                        };
                     }
                 }
             }
@@ -434,38 +472,28 @@ export default {
         // Start worker pool
         // ------------------------------------------------------------
 
-        const workerCount =
-            Math.min(
-                concurrency,
-                batches.length
+        const tasks =
+            new Array(
+                workerCount
             );
-
-        const tasks = [];
 
         for (
             let i = 0;
             i < workerCount;
             i += 1
         ) {
-            tasks.push(
-                processWorker()
-            );
+            tasks[i] =
+                processWorker();
         }
 
-        const workerResults =
-            await Promise.all(
-                tasks
-            );
-
-        // ------------------------------------------------------------
-        // Combine results from all dispatcher workers.
-        // ------------------------------------------------------------
-
-        const results =
-            workerResults.flat();
+        await Promise.all(
+            tasks
+        );
 
         // ------------------------------------------------------------
         // Return complete JSON response.
+        //
+        // There is now only ONE result array and ONE serialization.
         // ------------------------------------------------------------
 
         return new Response(
