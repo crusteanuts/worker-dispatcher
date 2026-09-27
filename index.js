@@ -115,13 +115,16 @@ export default {
         // ------------------------------------------------------------
 
         if (candidates.length === 0) {
-            return new Response(null, {
-                status: 200,
-                headers: {
-                    "Content-Type":
-                        "application/x-ndjson"
+            return new Response(
+                JSON.stringify([]),
+                {
+                    status: 200,
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    }
                 }
-            });
+            );
         }
 
         // ------------------------------------------------------------
@@ -139,27 +142,6 @@ export default {
                 candidates.slice(
                     i,
                     i + batchSize
-                )
-            );
-        }
-
-        // ------------------------------------------------------------
-        // Output stream
-        // ------------------------------------------------------------
-
-        const stream =
-            new TransformStream();
-
-        const writer =
-            stream.writable.getWriter();
-
-        const encoder =
-            new TextEncoder();
-
-        async function writeResult(result) {
-            await writer.write(
-                encoder.encode(
-                    JSON.stringify(result) + "\n"
                 )
             );
         }
@@ -214,6 +196,8 @@ export default {
         }
 
         async function processWorker() {
+            const results = [];
+
             while (true) {
                 const batchIndex =
                     nextBatchIndex++;
@@ -222,7 +206,7 @@ export default {
                     batchIndex >=
                     batches.length
                 ) {
-                    return;
+                    return results;
                 }
 
                 const batch =
@@ -279,7 +263,7 @@ export default {
                             const candidate
                             of batch
                         ) {
-                            await writeResult({
+                            results.push({
                                 key:
                                     candidate.key,
 
@@ -310,7 +294,7 @@ export default {
                             const candidate
                             of batch
                         ) {
-                            await writeResult({
+                            results.push({
                                 key:
                                     candidate.key,
 
@@ -340,7 +324,7 @@ export default {
                             const candidate
                             of batch
                         ) {
-                            await writeResult({
+                            results.push({
                                 key:
                                     candidate.key,
 
@@ -377,7 +361,7 @@ export default {
                             data.results[i];
 
                         if (!result) {
-                            await writeResult({
+                            results.push({
                                 key:
                                     candidate.key,
 
@@ -397,7 +381,7 @@ export default {
                             continue;
                         }
 
-                        await writeResult({
+                        results.push({
                             key:
                                 candidate.key,
 
@@ -425,7 +409,7 @@ export default {
                         const candidate
                         of batch
                     ) {
-                        await writeResult({
+                        results.push({
                             key:
                                 candidate.key,
 
@@ -456,42 +440,41 @@ export default {
                 batches.length
             );
 
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    const tasks = [];
+        const tasks = [];
 
-                    for (
-                        let i = 0;
-                        i < workerCount;
-                        i += 1
-                    ) {
-                        tasks.push(
-                            processWorker()
-                        );
-                    }
+        for (
+            let i = 0;
+            i < workerCount;
+            i += 1
+        ) {
+            tasks.push(
+                processWorker()
+            );
+        }
 
-                    await Promise.all(
-                        tasks
-                    );
-
-                } finally {
-                    await writer.close();
-                }
-            })()
-        );
+        const workerResults =
+            await Promise.all(
+                tasks
+            );
 
         // ------------------------------------------------------------
-        // Return streaming response
+        // Combine results from all dispatcher workers.
+        // ------------------------------------------------------------
+
+        const results =
+            workerResults.flat();
+
+        // ------------------------------------------------------------
+        // Return complete JSON response.
         // ------------------------------------------------------------
 
         return new Response(
-            stream.readable,
+            JSON.stringify(results),
             {
                 status: 200,
                 headers: {
                     "Content-Type":
-                        "application/x-ndjson",
+                        "application/json",
 
                     "Cache-Control":
                         "no-cache"
