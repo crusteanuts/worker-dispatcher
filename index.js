@@ -252,6 +252,24 @@ export default {
                     getRandomWorker();
 
                 // ----------------------------------------------------
+                // Pass the requested upstream Host to the proxy worker
+                // using its existing ?host= mechanism.
+                //
+                // The proxy worker reads this parameter and sets the
+                // Host header on the request to SmugMug.
+                // ----------------------------------------------------
+
+                const proxyUrl =
+                    new URL(workerUrl);
+
+                if (headers.Host) {
+                    proxyUrl.searchParams.set(
+                        "host",
+                        headers.Host
+                    );
+                }
+
+                // ----------------------------------------------------
                 // Build only the URL array needed by the proxy worker.
                 //
                 // This avoids creating a batch array with slice().
@@ -280,7 +298,7 @@ export default {
 
                     const response =
                         await fetch(
-                            workerUrl,
+                            proxyUrl.toString(),
                             {
                                 method: "POST",
 
