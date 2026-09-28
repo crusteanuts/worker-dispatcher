@@ -133,10 +133,21 @@ export default {
         //
         // Do NOT create a batches array.
         //
-        // Each processWorker() calculates its batch boundaries
-        // directly from the shared batch index.
+        // Each dispatcher worker calculates its batch boundaries
+        // directly from the batch index. This avoids creating:
+        //
+        //     candidates.slice(...)
+        //
+        // arrays for every batch.
         //
         // Results are written directly into one preallocated array.
+        // This avoids:
+        //
+        //     one results[] per worker
+        //     Promise.all() result arrays
+        //     workerResults.flat()
+        //
+        // The proxy worker behavior remains unchanged.
         // ------------------------------------------------------------
 
         const batchCount =
@@ -152,12 +163,20 @@ export default {
             );
 
         // Preallocate the final result array.
+        //
+        // Each candidate gets exactly one result slot.
+        //
+        // This is important because it means we do not have to
+        // accumulate separate arrays and merge them afterward.
         const results =
             new Array(
                 candidates.length
             );
 
         // Shared batch counter.
+        //
+        // Each concurrent processWorker() claims exactly one batch
+        // before reaching its next await.
         let nextBatchIndex = 0;
 
         // ------------------------------------------------------------
@@ -273,6 +292,8 @@ export default {
                 try {
                     // ------------------------------------------------
                     // Send the batch to the proxy worker.
+                    //
+                    // Headers are forwarded exactly as before.
                     // ------------------------------------------------
 
                     const response =
@@ -406,7 +427,7 @@ export default {
 
                         const candidate =
                             candidates[
-                                candidateIndex
+                            candidateIndex
                             ];
 
                         const result =
@@ -488,71 +509,31 @@ export default {
         }
 
         // ------------------------------------------------------------
-        // Run the dispatcher in waves.
-        //
-        // Each dispatcher worker handles ONE batch at a time.
-        //
-        // With:
-        //
-        //     concurrency = 20
-        //     batchSize = 10
-        //
-        // we run:
-        //
-        //     Wave 1: 10 batches × 10 URLs = 100 URLs
-        //     WAIT until all 10 batches finish
-        //     Wave 2: 10 batches × 10 URLs = 100 URLs
-        //
-        // This prevents 20 batches from being in flight at once.
-        //
-        // The requested concurrency value remains unchanged; this
-        // only limits the number of simultaneously active dispatcher
-        // workers to 10.
+        // Start worker pool
         // ------------------------------------------------------------
 
-        const WAVE_SIZE = 10;
-
-        while (
-            nextBatchIndex <
-            batchCount
-        ) {
-            const waveCount =
-                Math.min(
-                    WAVE_SIZE,
-                    batchCount -
-                        nextBatchIndex
-                );
-
-            const tasks =
-                new Array(
-                    waveCount
-                );
-
-            for (
-                let i = 0;
-                i < waveCount;
-                i += 1
-            ) {
-                tasks[i] =
-                    processWorker();
-            }
-
-            // --------------------------------------------------------
-            // IMPORTANT:
-            //
-            // Wait for EVERY worker in this wave to finish before
-            // starting the next wave.
-            // --------------------------------------------------------
-
-            await Promise.all(
-                tasks
+        const tasks =
+            new Array(
+                workerCount
             );
+
+        for (
+            let i = 0;
+            i < workerCount;
+            i += 1
+        ) {
+            tasks[i] =
+                processWorker();
         }
+
+        await Promise.all(
+            tasks
+        );
 
         // ------------------------------------------------------------
         // Return complete JSON response.
         //
-        // There is only ONE result array and ONE serialization.
+        // There is now only ONE result array and ONE serialization.
         // ------------------------------------------------------------
 
         return new Response(
